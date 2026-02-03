@@ -1,0 +1,20 @@
+[package]
+name = "http_bench_demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.56", features = ["derive"] }
+hdrhistogram = "7.5.4"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time", "net"] }
+
+# HTTP client for the benchmark (async).
+reqwest = { version = "0.13.1", default-features = false }
+
+# Servers to compare.
+actix-web = "4.12.1"
+
+may_minihttp = "0.1.11"
+
+axum = "0.8.4"
