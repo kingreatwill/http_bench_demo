@@ -893,9 +893,12 @@ dependencies = [
  "axum",
  "clap",
  "hdrhistogram",
+ "hyper",
+ "hyper-util",
  "may_minihttp",
  "reqwest",
  "tokio",
+ "tower",
 ]
 
 [[package]]

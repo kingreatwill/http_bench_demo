@@ -27,6 +27,11 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:18082")]
         addr: String,
     },
+    /// Run an axum router served by hyper (manual http1 connection loop).
+    ServeAxumHyper {
+        #[arg(long, default_value = "127.0.0.1:18084")]
+        addr: String,
+    },
     /// Run a may-minihttp server with a /health and /plaintext endpoint.
     ServeMay {
         #[arg(long, default_value = "127.0.0.1:18081")]
@@ -83,6 +88,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::ServeActix { addr, workers } => serve_actix(&addr, workers).context("serve-actix"),
         Cmd::ServeAxum { addr } => serve_axum(&addr).context("serve-axum"),
+        Cmd::ServeAxumHyper { addr } => serve_axum_hyper(&addr).context("serve-axum-hyper"),
         Cmd::ServeMay { addr } => serve_may(&addr).context("serve-may"),
         Cmd::ServeStd { addr, workers } => serve_std(&addr, workers).context("serve-std"),
         Cmd::Bench {
@@ -155,7 +161,10 @@ fn serve_actix(addr: &str, workers: usize) -> Result<()> {
     let res: std::io::Result<()> = system.block_on(async move {
         let mut server = HttpServer::new(|| {
             App::new()
-                .route("/health", web::get().to(|| async { HttpResponse::Ok().finish() }))
+                .route(
+                    "/health",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                )
                 .route(
                     "/plaintext",
                     web::get().to(|| async {
@@ -209,14 +218,69 @@ fn serve_axum(addr: &str) -> Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
 
-        axum::serve(listener, app)
-            .await
-            .context("axum serve")?;
+        axum::serve(listener, app).await.context("axum serve")?;
 
         Ok::<_, anyhow::Error>(())
     })?;
 
     Ok(())
+}
+
+fn serve_axum_hyper(addr: &str) -> Result<()> {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tower::util::ServiceExt;
+
+    fn plaintext() -> Response {
+        let mut resp = "OK".into_response();
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        resp
+    }
+
+    let addr = addr.to_string();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    rt.block_on(async move {
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route("/plaintext", get(|| async { plaintext() }));
+
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("bind {addr}"))?;
+
+        loop {
+            let (stream, _) = listener.accept().await.context("accept")?;
+            let io = TokioIo::new(stream);
+            let app = app.clone();
+
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    async move {
+                        let req = req.map(Body::new);
+                        app.oneshot(req).await
+                    }
+                });
+
+                if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
+                    eprintln!("hyper connection error: {err}");
+                }
+            });
+        }
+    })
 }
 
 fn serve_may(addr: &str) -> Result<()> {
@@ -226,7 +290,11 @@ fn serve_may(addr: &str) -> Result<()> {
     struct PlaintextService;
 
     impl HttpService for PlaintextService {
-        fn call(&mut self, req: Request<'_, '_, '_>, rsp: &mut Response<'_>) -> std::io::Result<()> {
+        fn call(
+            &mut self,
+            req: Request<'_, '_, '_>,
+            rsp: &mut Response<'_>,
+        ) -> std::io::Result<()> {
             match req.path() {
                 "/health" | "/plaintext" => {
                     rsp.status_code(200, "OK");
@@ -249,10 +317,13 @@ fn serve_may(addr: &str) -> Result<()> {
     Ok(())
 }
 
-const STD_HEALTH_RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+const STD_HEALTH_RESP: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
 const STD_PLAINTEXT_RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
-const STD_404_RESP: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
-const STD_405_RESP: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+const STD_404_RESP: &[u8] =
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+const STD_405_RESP: &[u8] =
+    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
 
 fn serve_std(addr: &str, workers: usize) -> Result<()> {
     use std::net::TcpListener;
@@ -262,7 +333,9 @@ fn serve_std(addr: &str, workers: usize) -> Result<()> {
     eprintln!("std server listening on {addr}");
 
     let workers = match workers {
-        0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
         n => n,
     };
 
@@ -361,9 +434,7 @@ fn handle_std_conn(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
 }
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
@@ -407,7 +478,13 @@ impl BenchResult {
         let max = self.hist_micros.max();
 
         println!("{name}:");
-        println!("  ok={} err={} elapsed={:.2}s rps={:.0}", self.ok, self.err, self.elapsed.as_secs_f64(), self.rps());
+        println!(
+            "  ok={} err={} elapsed={:.2}s rps={:.0}",
+            self.ok,
+            self.err,
+            self.elapsed.as_secs_f64(),
+            self.rps()
+        );
         println!(
             "  latency: avg={} p50={} p90={} p99={} max={}",
             Self::fmt_micros(avg as u64),
@@ -450,7 +527,12 @@ async fn run_bench(
     Ok(result)
 }
 
-async fn bench_once(client: &reqwest::Client, url: &str, concurrency: usize, duration: Duration) -> Result<BenchResult> {
+async fn bench_once(
+    client: &reqwest::Client,
+    url: &str,
+    concurrency: usize,
+    duration: Duration,
+) -> Result<BenchResult> {
     let end = Instant::now() + duration;
     let url = url.to_string();
 
@@ -528,46 +610,125 @@ async fn run_compare(
     let may_addr = format!("{host}:{}", base_port + 1);
     let axum_addr = format!("{host}:{}", base_port + 2);
     let std_addr = format!("{host}:{}", base_port + 3);
+    let axum_hyper_addr = format!("{host}:{}", base_port + 4);
 
     let actix_url = format!("http://{actix_addr}/plaintext");
     let may_url = format!("http://{may_addr}/plaintext");
     let axum_url = format!("http://{axum_addr}/plaintext");
     let std_url = format!("http://{std_addr}/plaintext");
+    let axum_hyper_url = format!("http://{axum_hyper_addr}/plaintext");
 
     let mut actix = spawn_server(&exe, "serve-actix", &actix_addr, &[])?;
-    wait_ready(format!("http://{actix_addr}/health"), connect_timeout, request_timeout).await?;
-    let actix_res = run_bench(&actix_url, concurrency, warmup, duration, connect_timeout, request_timeout).await;
+    wait_ready(
+        format!("http://{actix_addr}/health"),
+        connect_timeout,
+        request_timeout,
+    )
+    .await?;
+    let actix_res = run_bench(
+        &actix_url,
+        concurrency,
+        warmup,
+        duration,
+        connect_timeout,
+        request_timeout,
+    )
+    .await;
     stop_child(&mut actix);
     let actix_res = actix_res?;
 
     let mut may = spawn_server(&exe, "serve-may", &may_addr, &[])?;
-    wait_ready(format!("http://{may_addr}/health"), connect_timeout, request_timeout).await?;
-    let may_res = run_bench(&may_url, concurrency, warmup, duration, connect_timeout, request_timeout).await;
+    wait_ready(
+        format!("http://{may_addr}/health"),
+        connect_timeout,
+        request_timeout,
+    )
+    .await?;
+    let may_res = run_bench(
+        &may_url,
+        concurrency,
+        warmup,
+        duration,
+        connect_timeout,
+        request_timeout,
+    )
+    .await;
     stop_child(&mut may);
     let may_res = may_res?;
 
     let mut axum = spawn_server(&exe, "serve-axum", &axum_addr, &[])?;
-    wait_ready(format!("http://{axum_addr}/health"), connect_timeout, request_timeout).await?;
-    let axum_res = run_bench(&axum_url, concurrency, warmup, duration, connect_timeout, request_timeout).await;
+    wait_ready(
+        format!("http://{axum_addr}/health"),
+        connect_timeout,
+        request_timeout,
+    )
+    .await?;
+    let axum_res = run_bench(
+        &axum_url,
+        concurrency,
+        warmup,
+        duration,
+        connect_timeout,
+        request_timeout,
+    )
+    .await;
     stop_child(&mut axum);
     let axum_res = axum_res?;
 
+    let mut axum_hyper = spawn_server(&exe, "serve-axum-hyper", &axum_hyper_addr, &[])?;
+    wait_ready(
+        format!("http://{axum_hyper_addr}/health"),
+        connect_timeout,
+        request_timeout,
+    )
+    .await?;
+    let axum_hyper_res = run_bench(
+        &axum_hyper_url,
+        concurrency,
+        warmup,
+        duration,
+        connect_timeout,
+        request_timeout,
+    )
+    .await;
+    stop_child(&mut axum_hyper);
+    let axum_hyper_res = axum_hyper_res?;
+
     let mut std = spawn_server(&exe, "serve-std", &std_addr, &["--workers", "0"])?;
-    wait_ready(format!("http://{std_addr}/health"), connect_timeout, request_timeout).await?;
-    let std_res = run_bench(&std_url, concurrency, warmup, duration, connect_timeout, request_timeout).await;
+    wait_ready(
+        format!("http://{std_addr}/health"),
+        connect_timeout,
+        request_timeout,
+    )
+    .await?;
+    let std_res = run_bench(
+        &std_url,
+        concurrency,
+        warmup,
+        duration,
+        connect_timeout,
+        request_timeout,
+    )
+    .await;
     stop_child(&mut std);
     let std_res = std_res?;
 
     println!("\n--- compare ---");
     actix_res.print("actix-web");
     axum_res.print("axum");
+    axum_hyper_res.print("axum+hyper");
     may_res.print("may-minihttp");
     std_res.print("std");
 
     Ok(())
 }
 
-fn spawn_server(exe: &std::path::Path, subcmd: &str, addr: &str, extra_args: &[&str]) -> Result<Child> {
+fn spawn_server(
+    exe: &std::path::Path,
+    subcmd: &str,
+    addr: &str,
+    extra_args: &[&str],
+) -> Result<Child> {
     let mut cmd = Command::new(exe);
     cmd.arg(subcmd).arg("--addr").arg(addr);
     cmd.args(extra_args);
@@ -576,7 +737,8 @@ fn spawn_server(exe: &std::path::Path, subcmd: &str, addr: &str, extra_args: &[&
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
-    cmd.spawn().with_context(|| format!("spawn server {subcmd} {addr}"))
+    cmd.spawn()
+        .with_context(|| format!("spawn server {subcmd} {addr}"))
 }
 
 fn stop_child(child: &mut Child) {
@@ -584,7 +746,11 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-async fn wait_ready(url: String, connect_timeout: Duration, request_timeout: Duration) -> Result<()> {
+async fn wait_ready(
+    url: String,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<()> {
     let connect_timeout = if connect_timeout > Duration::ZERO {
         connect_timeout
     } else {
