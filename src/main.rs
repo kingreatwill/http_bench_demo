@@ -32,6 +32,11 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:18084")]
         addr: String,
     },
+    /// Run an axum server on tokio-uring runtime with a /health and /plaintext endpoint.
+    ServeAxumUring {
+        #[arg(long, default_value = "127.0.0.1:18085")]
+        addr: String,
+    },
     /// Run a may-minihttp server with a /health and /plaintext endpoint.
     ServeMay {
         #[arg(long, default_value = "127.0.0.1:18081")]
@@ -89,6 +94,7 @@ fn main() -> Result<()> {
         Cmd::ServeActix { addr, workers } => serve_actix(&addr, workers).context("serve-actix"),
         Cmd::ServeAxum { addr } => serve_axum(&addr).context("serve-axum"),
         Cmd::ServeAxumHyper { addr } => serve_axum_hyper(&addr).context("serve-axum-hyper"),
+        Cmd::ServeAxumUring { addr } => serve_axum_uring(&addr).context("serve-axum-uring"),
         Cmd::ServeMay { addr } => serve_may(&addr).context("serve-may"),
         Cmd::ServeStd { addr, workers } => serve_std(&addr, workers).context("serve-std"),
         Cmd::Bench {
@@ -281,6 +287,55 @@ fn serve_axum_hyper(addr: &str) -> Result<()> {
             });
         }
     })
+}
+
+fn serve_axum_uring(addr: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return serve_axum_uring_linux(addr);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = addr;
+        bail!("serve-axum-uring requires Linux with io_uring support");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn serve_axum_uring_linux(addr: &str) -> Result<()> {
+    use axum::Router;
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+
+    fn plaintext() -> Response {
+        let mut resp = "OK".into_response();
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        resp
+    }
+
+    let addr = addr.to_string();
+    let result = tokio_uring::start(async move {
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route("/plaintext", get(|| async { plaintext() }));
+
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("bind {addr}"))?;
+
+        axum::serve(listener, app)
+            .await
+            .context("axum tokio-uring serve")?;
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    result?;
+    Ok(())
 }
 
 fn serve_may(addr: &str) -> Result<()> {
@@ -611,12 +666,16 @@ async fn run_compare(
     let axum_addr = format!("{host}:{}", base_port + 2);
     let std_addr = format!("{host}:{}", base_port + 3);
     let axum_hyper_addr = format!("{host}:{}", base_port + 4);
+    #[cfg(target_os = "linux")]
+    let axum_uring_addr = format!("{host}:{}", base_port + 5);
 
     let actix_url = format!("http://{actix_addr}/plaintext");
     let may_url = format!("http://{may_addr}/plaintext");
     let axum_url = format!("http://{axum_addr}/plaintext");
     let std_url = format!("http://{std_addr}/plaintext");
     let axum_hyper_url = format!("http://{axum_hyper_addr}/plaintext");
+    #[cfg(target_os = "linux")]
+    let axum_uring_url = format!("http://{axum_uring_addr}/plaintext");
 
     let mut actix = spawn_server(&exe, "serve-actix", &actix_addr, &[])?;
     wait_ready(
@@ -694,6 +753,28 @@ async fn run_compare(
     stop_child(&mut axum_hyper);
     let axum_hyper_res = axum_hyper_res?;
 
+    #[cfg(target_os = "linux")]
+    let axum_uring_res = {
+        let mut axum_uring = spawn_server(&exe, "serve-axum-uring", &axum_uring_addr, &[])?;
+        wait_ready(
+            format!("http://{axum_uring_addr}/health"),
+            connect_timeout,
+            request_timeout,
+        )
+        .await?;
+        let axum_uring_res = run_bench(
+            &axum_uring_url,
+            concurrency,
+            warmup,
+            duration,
+            connect_timeout,
+            request_timeout,
+        )
+        .await;
+        stop_child(&mut axum_uring);
+        axum_uring_res?
+    };
+
     let mut std = spawn_server(&exe, "serve-std", &std_addr, &["--workers", "0"])?;
     wait_ready(
         format!("http://{std_addr}/health"),
@@ -717,6 +798,10 @@ async fn run_compare(
     actix_res.print("actix-web");
     axum_res.print("axum");
     axum_hyper_res.print("axum+hyper");
+    #[cfg(target_os = "linux")]
+    axum_uring_res.print("axum+tokio-uring");
+    #[cfg(not(target_os = "linux"))]
+    println!("axum+tokio-uring: skipped (requires Linux + io_uring)");
     may_res.print("may-minihttp");
     std_res.print("std");
 
