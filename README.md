@@ -7,6 +7,7 @@
 - `axum`
 - `axum+hyper`
 - `axum+tokio-uring`（Linux + io_uring）
+- `volo-http`
 - `std`（Rust 标准库：`std::net::TcpListener`）
 
 ## 运行
@@ -20,7 +21,7 @@ cargo run --release --manifest-path Cargo.toml -- compare \
   --duration-secs 10 \
   --warmup-secs 1
 
-# 默认端口：actix=18080, may=18081, axum=18082, std=18083, axum+hyper=18084, axum+tokio-uring=18085（可用 --base-port 调整）
+# 默认端口：actix=18080, may=18081, axum=18082, std=18083, axum+hyper=18084, axum+tokio-uring=18085, volo-http=18086（可用 --base-port 调整）
 ```
 
 也可以分别启动 server，再手动 bench：
@@ -41,11 +42,14 @@ cargo run --release --manifest-path ./Cargo.toml -- serve-axum-hyper --addr 127.
 # axum+tokio-uring（Linux + io_uring）
 cargo run --release --manifest-path ./Cargo.toml -- serve-axum-uring --addr 127.0.0.1:18085
 
+# volo-http
+cargo run --release --manifest-path ./Cargo.toml -- serve-volo-http --addr 127.0.0.1:18086
+
 # std（Rust 标准库）
 cargo run --release --manifest-path ./Cargo.toml -- serve-std --addr 127.0.0.1:18083 --workers 0
 
 # bench
-cargo run --release --manifest-path ./Cargo.toml -- bench --url http://127.0.0.1:18082/plaintext --concurrency 128 --duration-secs 10 --request-timeout-ms 2000
+cargo run --release --manifest-path ./Cargo.toml -- bench --url http://127.0.0.1:18086/plaintext --concurrency 128 --duration-secs 10 --request-timeout-ms 2000
 ```
 
 ## Go /plaintext（可选）

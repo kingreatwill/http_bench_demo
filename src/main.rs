@@ -37,6 +37,11 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:18085")]
         addr: String,
     },
+    /// Run a volo-http server with a /health and /plaintext endpoint.
+    ServeVoloHttp {
+        #[arg(long, default_value = "127.0.0.1:18086")]
+        addr: String,
+    },
     /// Run a may-minihttp server with a /health and /plaintext endpoint.
     ServeMay {
         #[arg(long, default_value = "127.0.0.1:18081")]
@@ -95,6 +100,7 @@ fn main() -> Result<()> {
         Cmd::ServeAxum { addr } => serve_axum(&addr).context("serve-axum"),
         Cmd::ServeAxumHyper { addr } => serve_axum_hyper(&addr).context("serve-axum-hyper"),
         Cmd::ServeAxumUring { addr } => serve_axum_uring(&addr).context("serve-axum-uring"),
+        Cmd::ServeVoloHttp { addr } => serve_volo_http(&addr).context("serve-volo-http"),
         Cmd::ServeMay { addr } => serve_may(&addr).context("serve-may"),
         Cmd::ServeStd { addr, workers } => serve_std(&addr, workers).context("serve-std"),
         Cmd::Bench {
@@ -335,6 +341,44 @@ fn serve_axum_uring_linux(addr: &str) -> Result<()> {
     });
 
     result?;
+    Ok(())
+}
+
+fn serve_volo_http(addr: &str) -> Result<()> {
+    use volo_http::Address;
+    use volo_http::http::StatusCode;
+    use volo_http::server::route::get;
+    use volo_http::{Router, Server};
+
+    async fn health() -> StatusCode {
+        StatusCode::OK
+    }
+
+    async fn plaintext() -> &'static str {
+        "OK"
+    }
+
+    let addr: std::net::SocketAddr = addr.parse().with_context(|| format!("parse {addr}"))?;
+    let addr = Address::from(addr);
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/plaintext", get(plaintext));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    rt.block_on(async move {
+        Server::new(app)
+            .run(addr)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))
+            .context("volo-http serve")?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+
     Ok(())
 }
 
@@ -668,6 +712,7 @@ async fn run_compare(
     let axum_hyper_addr = format!("{host}:{}", base_port + 4);
     #[cfg(target_os = "linux")]
     let axum_uring_addr = format!("{host}:{}", base_port + 5);
+    let volo_http_addr = format!("{host}:{}", base_port + 6);
 
     let actix_url = format!("http://{actix_addr}/plaintext");
     let may_url = format!("http://{may_addr}/plaintext");
@@ -676,6 +721,7 @@ async fn run_compare(
     let axum_hyper_url = format!("http://{axum_hyper_addr}/plaintext");
     #[cfg(target_os = "linux")]
     let axum_uring_url = format!("http://{axum_uring_addr}/plaintext");
+    let volo_http_url = format!("http://{volo_http_addr}/plaintext");
 
     let mut actix = spawn_server(&exe, "serve-actix", &actix_addr, &[])?;
     wait_ready(
@@ -775,6 +821,25 @@ async fn run_compare(
         axum_uring_res?
     };
 
+    let mut volo_http = spawn_server(&exe, "serve-volo-http", &volo_http_addr, &[])?;
+    wait_ready(
+        format!("http://{volo_http_addr}/health"),
+        connect_timeout,
+        request_timeout,
+    )
+    .await?;
+    let volo_http_res = run_bench(
+        &volo_http_url,
+        concurrency,
+        warmup,
+        duration,
+        connect_timeout,
+        request_timeout,
+    )
+    .await;
+    stop_child(&mut volo_http);
+    let volo_http_res = volo_http_res?;
+
     let mut std = spawn_server(&exe, "serve-std", &std_addr, &["--workers", "0"])?;
     wait_ready(
         format!("http://{std_addr}/health"),
@@ -802,6 +867,7 @@ async fn run_compare(
     axum_uring_res.print("axum+tokio-uring");
     #[cfg(not(target_os = "linux"))]
     println!("axum+tokio-uring: skipped (requires Linux + io_uring)");
+    volo_http_res.print("volo-http");
     may_res.print("may-minihttp");
     std_res.print("std");
 

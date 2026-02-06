@@ -21,6 +21,7 @@ axum = "0.8.4"
 hyper = { version = "1.8.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.19", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
+volo-http = "0.4.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5.0"
